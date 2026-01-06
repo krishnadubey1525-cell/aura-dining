@@ -13,7 +13,7 @@ export default function AdminLoginPage() {
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isSignUp, setIsSignUp] = useState(false);
-  const { signIn, signUp, isAdmin, user, isLoading: authLoading } = useAuth();
+  const { signIn, signUp, signOut, isAdmin, user, isLoading: authLoading } = useAuth();
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -21,6 +21,52 @@ export default function AdminLoginPage() {
       navigate('/admin/dashboard');
     }
   }, [user, isAdmin, navigate]);
+
+  const handleLogout = async () => {
+    await signOut();
+  };
+
+  // Show access denied if user is logged in but not admin
+  if (user && !isAdmin && !authLoading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center p-4">
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="w-full max-w-md"
+        >
+          <div className="text-center mb-8">
+            <h1 className="text-4xl font-display font-bold text-gradient-gold mb-2">
+              Lumière
+            </h1>
+          </div>
+
+          <div className="bg-card border border-destructive/50 rounded-2xl p-8 shadow-lg text-center">
+            <div className="w-16 h-16 bg-destructive/10 rounded-full flex items-center justify-center mx-auto mb-4">
+              <Lock className="h-8 w-8 text-destructive" />
+            </div>
+            <h2 className="text-xl font-semibold text-foreground mb-2">Access Denied</h2>
+            <p className="text-muted-foreground mb-6">
+              Your account ({user.email}) does not have admin privileges.
+              Please contact the restaurant owner to request access.
+            </p>
+            <Button 
+              onClick={handleLogout}
+              variant="outline"
+              className="w-full"
+            >
+              <LogIn className="h-5 w-5 mr-2" />
+              Sign Out & Try Another Account
+            </Button>
+          </div>
+
+          <p className="text-center text-xs text-muted-foreground mt-6">
+            Only authorized administrators can access this dashboard.
+          </p>
+        </motion.div>
+      </div>
+    );
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
