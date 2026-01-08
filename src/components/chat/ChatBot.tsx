@@ -1,112 +1,22 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { MessageCircle, X, Send, Loader2 } from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { ScrollArea } from '@/components/ui/scroll-area';
-import { toast } from 'sonner';
+import { useState, useRef, useEffect } from "react";
+import { MessageCircle, X, Send, Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { supabase } from "@/integrations/supabase/client";
+import { toast } from "sonner";
 
-type Message = {
-  role: 'user' | 'assistant';
+interface Message {
+  role: "user" | "assistant";
   content: string;
-};
-
-const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
-
-async function streamChat({
-  messages,
-  onDelta,
-  onDone,
-  onError,
-}: {
-  messages: Message[];
-  onDelta: (deltaText: string) => void;
-  onDone: () => void;
-  onError: (error: Error) => void;
-}) {
-  try {
-    const resp = await fetch(CHAT_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-      },
-      body: JSON.stringify({ messages }),
-    });
-
-    if (!resp.ok) {
-      const errorData = await resp.json().catch(() => ({}));
-      throw new Error(errorData.error || "Failed to get response");
-    }
-
-    if (!resp.body) {
-      throw new Error("No response body");
-    }
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let textBuffer = "";
-    let streamDone = false;
-
-    while (!streamDone) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      textBuffer += decoder.decode(value, { stream: true });
-
-      let newlineIndex: number;
-      while ((newlineIndex = textBuffer.indexOf("\n")) !== -1) {
-        let line = textBuffer.slice(0, newlineIndex);
-        textBuffer = textBuffer.slice(newlineIndex + 1);
-
-        if (line.endsWith("\r")) line = line.slice(0, -1);
-        if (line.startsWith(":") || line.trim() === "") continue;
-        if (!line.startsWith("data: ")) continue;
-
-        const jsonStr = line.slice(6).trim();
-        if (jsonStr === "[DONE]") {
-          streamDone = true;
-          break;
-        }
-
-        try {
-          const parsed = JSON.parse(jsonStr);
-          const content = parsed.choices?.[0]?.delta?.content as string | undefined;
-          if (content) onDelta(content);
-        } catch {
-          textBuffer = line + "\n" + textBuffer;
-          break;
-        }
-      }
-    }
-
-    if (textBuffer.trim()) {
-      for (let raw of textBuffer.split("\n")) {
-        if (!raw) continue;
-        if (raw.endsWith("\r")) raw = raw.slice(0, -1);
-        if (raw.startsWith(":") || raw.trim() === "") continue;
-        if (!raw.startsWith("data: ")) continue;
-        const jsonStr = raw.slice(6).trim();
-        if (jsonStr === "[DONE]") continue;
-        try {
-          const parsed = JSON.parse(jsonStr);
-          const content = parsed.choices?.[0]?.delta?.content as string | undefined;
-          if (content) onDelta(content);
-        } catch {}
-      }
-    }
-
-    onDone();
-  } catch (error) {
-    onError(error instanceof Error ? error : new Error("Unknown error"));
-  }
 }
 
 export default function ChatBot() {
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([
-    { role: 'assistant', content: 'Bonjour! Welcome to Lumière. How may I assist you today?' }
+    { role: "assistant", content: "Bonjour! Welcome to Lumière. I'm here to help with menu recommendations, reservations, or any questions. How may I assist you today?" }
   ]);
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -116,138 +26,196 @@ export default function ChatBot() {
     }
   }, [messages]);
 
-  const sendMessage = useCallback(async () => {
+  const extractAndProcessReservation = async (content: string): Promise<string> => {
+    const reservationMatch = content.match(/\[RESERVATION_DATA\](.*?)\[\/RESERVATION_DATA\]/s);
+    
+    if (reservationMatch) {
+      try {
+        const reservationData = JSON.parse(reservationMatch[1]);
+        
+        // Call the edge function to book the reservation
+        const { data, error } = await supabase.functions.invoke("chat", {
+          body: { action: "book_reservation", reservationData }
+        });
+
+        if (error || data?.error) {
+          console.error("Reservation booking failed:", error || data?.error);
+          toast.error("Failed to book reservation. Please try again.");
+          return content.replace(/\[RESERVATION_DATA\].*?\[\/RESERVATION_DATA\]/s, 
+            "\n\n⚠️ I apologize, but there was an issue booking your reservation. Please try again or call us directly.");
+        }
+
+        toast.success("Reservation booked successfully!");
+        return content.replace(/\[RESERVATION_DATA\].*?\[\/RESERVATION_DATA\]/s, 
+          `\n\n✅ **Reservation Confirmed!**\n- Name: ${reservationData.name}\n- Date: ${reservationData.date}\n- Time: ${reservationData.time}\n- Party size: ${reservationData.party_size} guests\n\nYou'll receive a confirmation shortly. À bientôt!`);
+      } catch (e) {
+        console.error("Failed to parse reservation data:", e);
+        return content.replace(/\[RESERVATION_DATA\].*?\[\/RESERVATION_DATA\]/s, "");
+      }
+    }
+    
+    return content;
+  };
+
+  const handleSend = async () => {
     if (!input.trim() || isLoading) return;
 
-    const userMessage: Message = { role: 'user', content: input.trim() };
+    const userMessage: Message = { role: "user", content: input.trim() };
     setMessages(prev => [...prev, userMessage]);
-    setInput('');
+    setInput("");
     setIsLoading(true);
 
-    let assistantContent = '';
-
-    const updateAssistant = (chunk: string) => {
-      assistantContent += chunk;
-      setMessages(prev => {
-        const last = prev[prev.length - 1];
-        if (last?.role === 'assistant' && prev.length > 1 && prev[prev.length - 2]?.role === 'user') {
-          return prev.map((m, i) => (i === prev.length - 1 ? { ...m, content: assistantContent } : m));
-        }
-        return [...prev, { role: 'assistant', content: assistantContent }];
+    try {
+      const response = await supabase.functions.invoke("chat", {
+        body: { messages: [...messages, userMessage].map(m => ({ role: m.role, content: m.content })) }
       });
-    };
 
-    await streamChat({
-      messages: [...messages, userMessage],
-      onDelta: updateAssistant,
-      onDone: () => setIsLoading(false),
-      onError: (error) => {
-        console.error('Chat error:', error);
-        toast.error('Unable to send message', { description: error.message });
-        setIsLoading(false);
-      },
-    });
-  }, [input, isLoading, messages]);
+      if (response.error) {
+        throw new Error(response.error.message);
+      }
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
+      // Handle streaming response
+      const reader = response.data.getReader();
+      const decoder = new TextDecoder();
+      let assistantMessage = "";
+
+      setMessages(prev => [...prev, { role: "assistant", content: "" }]);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split("\n");
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6);
+            if (data === "[DONE]") continue;
+            
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices?.[0]?.delta?.content || "";
+              assistantMessage += content;
+              
+              setMessages(prev => {
+                const updated = [...prev];
+                updated[updated.length - 1] = { role: "assistant", content: assistantMessage };
+                return updated;
+              });
+            } catch {
+              // Skip unparseable chunks
+            }
+          }
+        }
+      }
+
+      // Process any reservation data in the response
+      const processedContent = await extractAndProcessReservation(assistantMessage);
+      if (processedContent !== assistantMessage) {
+        setMessages(prev => {
+          const updated = [...prev];
+          updated[updated.length - 1] = { role: "assistant", content: processedContent };
+          return updated;
+        });
+      }
+
+    } catch (error) {
+      console.error("Chat error:", error);
+      setMessages(prev => [...prev, { 
+        role: "assistant", 
+        content: "I apologize, but I'm having trouble connecting. Please try again or call us at (555) 123-4567." 
+      }]);
+    } finally {
+      setIsLoading(false);
     }
+  };
+
+  const formatMessage = (content: string) => {
+    // Simple markdown-like formatting
+    return content
+      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\n/g, '<br />');
   };
 
   return (
     <>
-      {/* Floating Button */}
-      <motion.button
+      {/* Chat Button */}
+      <button
         onClick={() => setIsOpen(true)}
-        className={`fixed bottom-6 right-6 z-50 w-14 h-14 rounded-full bg-secondary text-secondary-foreground shadow-lg flex items-center justify-center hover:scale-105 transition-transform ${isOpen ? 'hidden' : ''}`}
-        whileHover={{ scale: 1.1 }}
-        whileTap={{ scale: 0.95 }}
+        className={`fixed bottom-6 right-6 z-50 h-14 w-14 rounded-full bg-primary text-primary-foreground shadow-lg hover:bg-primary/90 transition-all duration-300 flex items-center justify-center ${isOpen ? "scale-0" : "scale-100"}`}
         aria-label="Open chat"
       >
-        <MessageCircle className="w-6 h-6" />
-      </motion.button>
+        <MessageCircle className="h-6 w-6" />
+      </button>
 
       {/* Chat Window */}
-      <AnimatePresence>
-        {isOpen && (
-          <motion.div
-            initial={{ opacity: 0, y: 20, scale: 0.95 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 20, scale: 0.95 }}
-            transition={{ duration: 0.2 }}
-            className="fixed bottom-6 right-6 z-50 w-[360px] h-[500px] bg-card border border-border rounded-2xl shadow-2xl flex flex-col overflow-hidden"
-          >
-            {/* Header */}
-            <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-secondary/10">
-              <div className="flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                <span className="font-medium text-foreground">Lumière Assistant</span>
-              </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => setIsOpen(false)}
-                className="h-8 w-8"
+      <div className={`fixed bottom-6 right-6 z-50 w-[380px] max-w-[calc(100vw-3rem)] bg-background border border-border rounded-2xl shadow-2xl transition-all duration-300 origin-bottom-right ${isOpen ? "scale-100 opacity-100" : "scale-0 opacity-0 pointer-events-none"}`}>
+        {/* Header */}
+        <div className="flex items-center justify-between p-4 border-b border-border bg-muted/50 rounded-t-2xl">
+          <div>
+            <h3 className="font-semibold text-foreground">Lumière Concierge</h3>
+            <p className="text-xs text-muted-foreground">Ask about our menu or book a table</p>
+          </div>
+          <Button variant="ghost" size="icon" onClick={() => setIsOpen(false)}>
+            <X className="h-5 w-5" />
+          </Button>
+        </div>
+
+        {/* Messages */}
+        <ScrollArea className="h-[400px] p-4" ref={scrollRef}>
+          <div className="space-y-4">
+            {messages.map((message, index) => (
+              <div
+                key={index}
+                className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
               >
-                <X className="w-4 h-4" />
-              </Button>
-            </div>
-
-            {/* Messages */}
-            <ScrollArea className="flex-1 p-4" ref={scrollRef}>
-              <div className="space-y-4">
-                {messages.map((message, index) => (
-                  <div
-                    key={index}
-                    className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                  >
-                    <div
-                      className={`max-w-[80%] px-4 py-2 rounded-2xl text-sm ${
-                        message.role === 'user'
-                          ? 'bg-secondary text-secondary-foreground rounded-br-md'
-                          : 'bg-muted text-foreground rounded-bl-md'
-                      }`}
-                    >
-                      {message.content}
-                    </div>
-                  </div>
-                ))}
-                {isLoading && messages[messages.length - 1]?.role === 'user' && (
-                  <div className="flex justify-start">
-                    <div className="bg-muted text-foreground px-4 py-2 rounded-2xl rounded-bl-md">
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    </div>
-                  </div>
-                )}
-              </div>
-            </ScrollArea>
-
-            {/* Input */}
-            <div className="p-4 border-t border-border">
-              <div className="flex gap-2">
-                <Input
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder="Ask about our menu, hours..."
-                  className="flex-1"
-                  disabled={isLoading}
-                />
-                <Button
-                  onClick={sendMessage}
-                  disabled={!input.trim() || isLoading}
-                  size="icon"
-                  variant="gold"
+                <div
+                  className={`max-w-[85%] rounded-2xl px-4 py-2.5 ${
+                    message.role === "user"
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-muted text-foreground"
+                  }`}
                 >
-                  <Send className="w-4 h-4" />
-                </Button>
+                  <p 
+                    className="text-sm leading-relaxed"
+                    dangerouslySetInnerHTML={{ __html: formatMessage(message.content) }}
+                  />
+                </div>
               </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+            ))}
+            {isLoading && messages[messages.length - 1]?.role === "user" && (
+              <div className="flex justify-start">
+                <div className="bg-muted rounded-2xl px-4 py-3">
+                  <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+                </div>
+              </div>
+            )}
+          </div>
+        </ScrollArea>
+
+        {/* Input */}
+        <div className="p-4 border-t border-border">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSend();
+            }}
+            className="flex gap-2"
+          >
+            <Input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="Type your message..."
+              className="flex-1"
+              disabled={isLoading}
+            />
+            <Button type="submit" size="icon" disabled={isLoading || !input.trim()}>
+              <Send className="h-4 w-4" />
+            </Button>
+          </form>
+        </div>
+      </div>
     </>
   );
 }
